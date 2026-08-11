@@ -1,12 +1,12 @@
 --[[
-    buygrimoire.lua
+    buygrim.lua
     Navigates to "Incarnation of Cazic" and buys N x
     "Grimoire of Profound Experience" from the point-merchant window,
     paying in "Ancient Fragments of Knowledge".
 
-    Usage:  /lua run buygrimoire        -- buy as many as currency allows
-            /lua run buygrimoire max    -- same as above, explicit
-            /lua run buygrimoire 5      -- buy at most 5
+    Usage:  /lua run buygrim        -- buy as many as currency allows
+            /lua run buygrim max    -- same as above, explicit
+            /lua run buygrim 5      -- buy at most 5
 
     Requires: MQ2Nav loaded, with a navmesh for the current zone.
 
@@ -252,6 +252,21 @@ local function clearCursor()
     return false
 end
 
+-- Close the vendor window and confirm it actually closed
+local function closeWindow()
+    if not wndOpen() then return true end
+
+    log('Closing vendor window.')
+    mq.cmdf('/notify %s %s leftmouseup', WND, C_DONE)
+    mq.delay(2000, function() return not wndOpen() end)
+
+    if wndOpen() then
+        warn('Vendor window did not close; close it by hand.')
+        return false
+    end
+    return true
+end
+
 -- Step 1: target -------------------------------------------------------------
 local function targetNPC()
     local spawn, used
@@ -472,8 +487,8 @@ local function main()
     if not idx then return end
 
     -- Spending is irreversible, so give a moment to bail out
-    warn(('Starting in 5s: %d purchase(s). \asType /lua stop to abort.\ax'):format(QUANTITY))
-    mq.delay(5000)
+    warn(('Starting in 2s: %d purchase(s). \asType /lua stop to abort.\ax'):format(QUANTITY))
+    mq.delay(2000)
 
     local startItems = mq.TLO.FindItemCount('=' .. ITEM_NAME)() or 0
     local startCur   = currencyOnHand() or 0
@@ -498,9 +513,7 @@ local function main()
     if bought == QUANTITY then
         log('\agDone.\ax')
     end
-
-    -- Leave the window open. Uncomment to close when finished:
-    -- mq.cmdf('/notify %s %s leftmouseup', WND, C_DONE)
 end
 
 main()
+closeWindow()   -- runs even if main() bailed out early
