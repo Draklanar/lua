@@ -112,12 +112,60 @@ local function wndOpen()
     return val(function() return mq.TLO.Window(WND).Open() end) == true
 end
 
--- Read the currency counter straight off the window label
-local function currencyOnHand()
-    local text = val(function() return child(C_CURVAL).Text() end)
-    if type(text) ~= 'string' then return nil end
-    return tonumber((text:gsub('[,%s]', '')))
+-- Currency name matching ----------------------------------------------------
+-- Vendors may label a currency in the plural ("Tokens of Might") while the
+-- lookup name is singular ("Token of Might"). Normalise both before compare.
+local function normName(s)
+    if type(s) ~= 'string' then return '' end
+    s = s:lower():gsub('[^%a%s]', ''):gsub('%s+', ' '):gsub('^%s+', ''):gsub('%s+$', '')
+    s = s:gsub('(%a+)', function(w) return (#w > 3 and w:sub(-1) == 's') and w:sub(1, -2) or w end)
+    return s
 end
+
+local function namesMatch(a, b)
+    a, b = normName(a), normName(b)
+    if a == '' or b == '' then return false end
+    return a == b or a:find(b, 1, true) ~= nil or b:find(a, 1, true) ~= nil
+end
+
+-- Read the spendable currency.
+-- ORDER MATTERS. An inventory ITEM can share a currency's name without being
+-- the thing the vendor deducts, so inventory is the LAST resort. Alt-currency
+-- is authoritative and updates live; the window label does NOT refresh while
+-- the window stays open, so it is only used at preflight.
+local function readCurrency(allowWindow)
+    local variants = { CURRENCY_NAME }
+    if CURRENCY_NAME:sub(-1) == 's' then
+        variants[#variants + 1] = CURRENCY_NAME:sub(1, -2)
+    else
+        variants[#variants + 1] = CURRENCY_NAME .. 's'
+    end
+    variants[#variants + 1] = CURRENCY_NAME:gsub('^(%a+)', '%1s', 1)
+
+    for _, name in ipairs(variants) do
+        local amount = val(function() return mq.TLO.Me.AltCurrency(name)() end)
+        if type(amount) == 'number' and amount > 0 then
+            return amount, ('alt-currency "%s"'):format(name)
+        end
+    end
+
+    if allowWindow and wndOpen() then
+        local label = val(function() return child(C_CURNAM).Text() end)
+        if namesMatch(label, CURRENCY_NAME) then
+            local text = val(function() return child(C_CURVAL).Text() end)
+            local n = type(text) == 'string' and tonumber((text:gsub('[,%s]', ''))) or nil
+            if n then return n, ('vendor label "%s"'):format(tostring(label)) end
+        end
+    end
+
+    local bag = mq.TLO.FindItemCount('=' .. CURRENCY_NAME)() or 0
+    if bag > 0 then return bag, 'inventory item (unverified)' end
+
+    return nil, 'not found'
+end
+
+local function currencyOnHand() return readCurrency(true) end
+local function currencyLive()   return readCurrency(false) end
 
 -- Find the row index of our item in the listbox (1-based, 0/nil = not found)
 local function findRow()
@@ -375,7 +423,8 @@ local function preflight()
         end
     end
 
-    local have = currencyOnHand()
+    local have, curSource = currencyOnHand()
+    if have then log(('%s: %d on hand (source: %s).'):format(CURRENCY_NAME, have, curSource)) end
     if not have then
         fail('Could not read the currency amount. Aborting rather than guessing.')
         return nil
@@ -405,12 +454,6 @@ local function preflight()
         return nil
     end
 
-    -- Soft warning only: bag space may not be readable on every build
-    local free = val(function() return mq.TLO.Me.FreeInventory() end)
-    if type(free) == 'number' and free < QUANTITY then
-        warn(('Only %d free inventory slot(s) for %d items; may stop early.')
-            :format(free, QUANTITY))
-    end
 
     log(('Will spend %d of %d %s.'):format(QUANTITY * price, have, label))
 
@@ -440,7 +483,7 @@ local function buyOne(price)
         return false
     end
 
-    local curBefore  = currencyOnHand() or 0
+    local curBefore  = select(1, currencyLive()) or 0
     local itemBefore = mq.TLO.FindItemCount('=' .. ITEM_NAME)() or 0
 
     mq.cmdf('/notify %s %s leftmouseup', WND, C_BUY)
@@ -451,7 +494,7 @@ local function buyOne(price)
 
     -- Success = currency dropped by the price, or the item count went up
     local landed = function()
-        local c = currencyOnHand()
+        local c = select(1, currencyLive())
         local i = mq.TLO.FindItemCount('=' .. ITEM_NAME)() or 0
         return (c and c <= curBefore - price) or i > itemBefore
     end
@@ -491,7 +534,7 @@ local function main()
     mq.delay(2000)
 
     local startItems = mq.TLO.FindItemCount('=' .. ITEM_NAME)() or 0
-    local startCur   = currencyOnHand() or 0
+    local startCur   = select(1, currencyLive()) or 0
     local bought     = 0
 
     for i = 1, QUANTITY do
@@ -505,7 +548,7 @@ local function main()
     end
 
     local endItems = mq.TLO.FindItemCount('=' .. ITEM_NAME)() or 0
-    local endCur   = currencyOnHand() or 0
+    local endCur   = select(1, currencyLive()) or 0
 
     log(('Bought %d. Inventory %d -> %d. Currency %d -> %d (spent %d).')
         :format(bought, startItems, endItems, startCur, endCur, startCur - endCur))

@@ -70,6 +70,8 @@ local function fail(msg) printf('\ar[buytok]\ax %s', msg) end
 
 -- Argument parsing ----------------------------------------------------------
 local QUANTITY = nil   -- nil = resolve max from currency during preflight
+local BUY_MAX  = true  -- false once an explicit quantity is given
+local MAX_ROUNDS = 20  -- safety cap on the keep-going loop
 
 if args[1] then
     local a = tostring(args[1]):lower()
@@ -81,6 +83,7 @@ if args[1] then
             return
         end
         QUANTITY = math.floor(n)
+        BUY_MAX  = false
     end
 end
 
@@ -134,33 +137,68 @@ local function clearCursor()
     return false
 end
 
--- Currency ------------------------------------------------------------------
--- Returns amount, source-description. Nil amount means "could not read".
-local function currencyOnHand()
-    -- 1. Point-merchant window label, but only if it names OUR currency
-    if MODE == 'point' and wndIsOpen(PWND) then
-        local label = val(function() return pchild(C_CURNAM).Text() end)
-        if type(label) == 'string' and label:lower():find(CURRENCY_NAME:lower(), 1, true) then
-            local text = val(function() return pchild(C_CURVAL).Text() end)
-            local n = type(text) == 'string' and tonumber((text:gsub('[,%s]', ''))) or nil
-            if n then return n, 'vendor window label' end
-        end
+
+
+-- Currency name matching ----------------------------------------------------
+-- Vendors may label a currency in the plural ("Tokens of Might") while the
+-- lookup name is singular ("Token of Might"). Normalise both before compare.
+local function normName(s)
+    if type(s) ~= 'string' then return '' end
+    s = s:lower():gsub('[^%a%s]', ''):gsub('%s+', ' '):gsub('^%s+', ''):gsub('%s+$', '')
+    -- strip a trailing 's' from each word so singular/plural collapse together
+    s = s:gsub('(%a+)', function(w) return (#w > 3 and w:sub(-1) == 's') and w:sub(1, -2) or w end)
+    return s
+end
+
+local function namesMatch(a, b)
+    a, b = normName(a), normName(b)
+    if a == '' or b == '' then return false end
+    return a == b or a:find(b, 1, true) ~= nil or b:find(a, 1, true) ~= nil
+end
+
+-- Read the spendable currency.
+-- ORDER MATTERS. An inventory ITEM can share a currency's name without being
+-- the thing the vendor deducts, so inventory is the LAST resort, never the
+-- first. Alt-currency is authoritative and updates live after each purchase.
+local function readCurrency(allowWindow)
+    -- 1. Alt currency, trying singular/plural variants of the configured name
+    local variants = { CURRENCY_NAME }
+    if CURRENCY_NAME:sub(-1) == 's' then
+        variants[#variants + 1] = CURRENCY_NAME:sub(1, -2)
+    else
+        variants[#variants + 1] = CURRENCY_NAME .. 's'
     end
+    -- also try pluralising the first word ("Token of Might" -> "Tokens of Might")
+    variants[#variants + 1] = CURRENCY_NAME:gsub('^(%a+)', '%1s', 1)
 
-    -- 2. Inventory item
-    local bag = mq.TLO.FindItemCount('=' .. CURRENCY_NAME)() or 0
-    if bag > 0 then return bag, 'inventory item' end
-
-    -- 3. Alt currency (singular or plural both work per MQ changelog)
-    for _, name in ipairs({ CURRENCY_NAME, (CURRENCY_NAME:gsub('s$', '')) }) do
+    for _, name in ipairs(variants) do
         local amount = val(function() return mq.TLO.Me.AltCurrency(name)() end)
         if type(amount) == 'number' and amount > 0 then
             return amount, ('alt-currency "%s"'):format(name)
         end
     end
 
+    -- 2. The vendor window label, if it names the same currency.
+    --    Only at preflight: this label does NOT refresh while the window is open.
+    if allowWindow and MODE == 'point' and wndIsOpen(PWND) then
+        local label = val(function() return pchild(C_CURNAM).Text() end)
+        if namesMatch(label, CURRENCY_NAME) then
+            local text = val(function() return pchild(C_CURVAL).Text() end)
+            local n = type(text) == 'string' and tonumber((text:gsub('[,%s]', ''))) or nil
+            if n then return n, ('vendor label "%s"'):format(tostring(label)) end
+        end
+    end
+
+    -- 3. Inventory item. Least trustworthy: a same-named item may not be the
+    --    currency the vendor actually deducts.
+    local bag = mq.TLO.FindItemCount('=' .. CURRENCY_NAME)() or 0
+    if bag > 0 then return bag, 'inventory item (unverified)' end
+
     return nil, 'not found'
 end
+
+local function currencyOnHand() return readCurrency(true) end
+local function currencyLive()   return readCurrency(false) end
 
 -- Confirmation dialog -------------------------------------------------------
 local function findYesButton(w, depth)
@@ -453,17 +491,16 @@ local function preflight()
     if QUANTITY == nil then
         QUANTITY = affordable
         log(('No quantity given: buying the max, %d.'):format(QUANTITY))
+        if have % cost > 0 then
+            log(('Ceiling is %d because %d %s remain unspent (%d needed for one more).')
+                :format(QUANTITY, have % cost, CURRENCY_NAME, cost - (have % cost)))
+        end
     elseif QUANTITY > affordable then
         fail(('Asked for %d (%d needed) but can only afford %d. Aborting.')
             :format(QUANTITY, QUANTITY * cost, affordable))
         return nil
     end
 
-    local free = val(function() return mq.TLO.Me.FreeInventory() end)
-    if type(free) == 'number' and free < QUANTITY then
-        warn(('Only %d free inventory slot(s) for %d items; may stop early.')
-            :format(free, QUANTITY))
-    end
 
     log(('Will spend %d of %d %s for %d x %s.')
         :format(QUANTITY * cost, have, CURRENCY_NAME, QUANTITY, ITEM_NAME))
@@ -548,21 +585,49 @@ local function main()
     mq.delay(2000)
 
     local startItems = itemCount()
-    local startCur   = select(1, currencyOnHand()) or 0
+    local startCur   = select(1, currencyLive()) or 0
     local bought     = 0
 
-    for i = 1, QUANTITY do
-        log(('Purchase %d of %d...'):format(i, QUANTITY))
-        if not buyOne(cost) then
-            fail(('Stopping after %d successful purchase(s).'):format(bought))
+    -- The currency readout is not always reliable, so QUANTITY may undercount.
+    -- When buying "max", keep going in rounds until a purchase genuinely fails
+    -- (buyOne only succeeds if the item count actually rose), rather than
+    -- trusting the number. An explicit quantity is still honoured exactly.
+    local rounds = 0
+    repeat
+        rounds = rounds + 1
+        local roundStart = bought
+
+        for i = 1, QUANTITY do
+            log(('Purchase %d of %d%s...'):format(i, QUANTITY,
+                rounds > 1 and (' (round %d)'):format(rounds) or ''))
+            if not buyOne(cost) then
+                log(('Purchase stopped after %d this round.'):format(bought - roundStart))
+                break
+            end
+            bought = bought + 1
+            mq.delay(400)
+        end
+
+        -- Only continue if we are in "max" mode, this round bought its full
+        -- allotment (so nothing blocked us), and we are still under the cap.
+        if not BUY_MAX or (bought - roundStart) < QUANTITY or rounds >= MAX_ROUNDS then
             break
         end
-        bought = bought + 1
-        mq.delay(400)
+
+        local nowHave = select(1, currencyLive()) or 0
+        local more = math.floor(nowHave / cost)
+        if more < 1 then break end
+
+        log(('Currency still reads %d -> %d more affordable. Continuing.'):format(nowHave, more))
+        QUANTITY = more
+    until false
+
+    if bought > 0 and rounds >= MAX_ROUNDS then
+        warn(('Hit the %d-round safety limit; run again to continue.'):format(MAX_ROUNDS))
     end
 
     local endItems = itemCount()
-    local endCur   = select(1, currencyOnHand()) or 0
+    local endCur   = select(1, currencyLive()) or 0
 
     log(('Bought %d. %s: %d -> %d. %s: %d -> %d (spent %d).')
         :format(bought, ITEM_NAME, startItems, endItems,
